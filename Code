@@ -1,0 +1,354 @@
+# Modelling 3-body particle decays on the Dalitz plot
+# Full solution for Tasks 1–4 (incl. speedups via vectorisation + precomputation)
+
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.optimize import minimize
+
+# -----------------------------
+# Constants (GeV, GeV^2 units)
+# -----------------------------
+m_dmeson = 1.97
+m_kaon   = 0.498
+m_pion   = 0.135
+
+md = m_dmeson
+ma = m_kaon   # a = K+
+mb = m_kaon   # b = K-
+mc = m_pion   # c = pi+
+
+# Resonance params (Task 2 & 3)
+mres_ab, gam_ab = 1.30, 0.015  
+mres_bc, gam_bc = 1.05, 0.015  
+
+
+# kinematics help 
+
+def kallen(x, y, z):
+    """Källén function λ(x,y,z) = x^2 + y^2 + z^2 - 2xy - 2xz - 2yz"""
+    return x*x + y*y + z*z - 2*x*y - 2*x*z - 2*y*z
+
+def m2bc_limits_from_m2ab(m2ab, md=md, ma=ma, mb=mb, mc=mc):
+    """
+    For d -> a b c, given s_ab = m2ab, return s_bc^min, s_bc^max (PDG 49.23a,b style).
+    Vectorised for numpy arrays.
+    """
+    s = m2ab
+    md2, ma2, mb2, mc2 = md*md, ma*ma, mb*mb, mc*mc
+
+    
+    s = np.asarray(s)
+    # Terms in the PDG expression
+    term1 = (s + mb2 - ma2) * (md2 - s - mc2)
+    rad   = kallen(s, ma2, mb2) * kallen(md2, s, mc2)
+    rad   = np.clip(rad, 0.0, None)
+    root  = np.sqrt(rad)
+
+    
+    denom = 2.0 * s
+    s_bc_min = mb2 + mc2 + (term1 - root) / denom
+    s_bc_max = mb2 + mc2 + (term1 + root) / denom
+    return s_bc_min, s_bc_max
+
+def phasespace_ranges(md=md, ma=ma, mb=mb, mc=mc):
+    """Overall rectangular proposal ranges for accept-reject."""
+    m2ab_min = (ma + mb)**2
+    m2ab_max = (md - mc)**2
+    m2bc_min = (mb + mc)**2
+    m2bc_max = (md - ma)**2
+    return m2ab_min, m2ab_max, m2bc_min, m2bc_max
+
+
+# -----------------------------
+# Task 1: uniform phasespace generator
+# -----------------------------
+def generate_phasespace(n, md=md, ma=ma, mb=mb, mc=mc, rng=None):
+    """
+    Generate exactly n events uniformly in allowed Dalitz region using accept-reject
+    from a bounding box in (m2ab, m2bc).
+    Returns arrays (m2ab, m2bc) of length n.
+    """
+    rng = np.random.default_rng() if rng is None else rng
+    m2ab_min, m2ab_max, m2bc_min, m2bc_max = phasespace_ranges(md, ma, mb, mc)
+
+    out_ab = np.empty(n, dtype=float)
+    out_bc = np.empty(n, dtype=float)
+    filled = 0
+
+    # Reasonable chunk size for speed (vectorised)
+    chunk = max(20000, n // 2)
+
+    while filled < n:
+        m2ab_try = rng.uniform(m2ab_min, m2ab_max, size=chunk)
+        m2bc_try = rng.uniform(m2bc_min, m2bc_max, size=chunk)
+
+        lo, hi = m2bc_limits_from_m2ab(m2ab_try, md, ma, mb, mc)
+        acc = (m2bc_try >= lo) & (m2bc_try <= hi)
+
+        k = int(np.sum(acc))
+        if k == 0:
+            continue
+
+        take = min(k, n - filled)
+        ab_acc = m2ab_try[acc]
+        bc_acc = m2bc_try[acc]
+        out_ab[filled:filled+take] = ab_acc[:take]
+        out_bc[filled:filled+take] = bc_acc[:take]
+        filled += take
+
+    return out_ab, out_bc
+
+
+# -----------------------------
+# Task 2/3 amplitude model(s)
+# -----------------------------
+def breit_wigner_amp(m2, mres, gamma):
+    """
+    Complex Breit-Wigner amplitude:
+    A = 1 / ((mres^2 - m2) - i(mres*gamma))
+    Vectorised.
+    """
+    return 1.0 / ((mres*mres - m2) - 1j*(mres*gamma))
+
+def weight_single_resonance(m2ab, mres=mres_ab, gamma=gam_ab):
+    """Observable ~ |A|^2 for resonance in ab."""
+    A = breit_wigner_amp(m2ab, mres, gamma)
+    return np.abs(A)**2
+
+def weight_interference(m2ab, m2bc, r2, theta2):
+    """Observable ~ |A1 + r2 e^{i theta2} A2|^2 (A1 in ab, A2 in bc)."""
+    A1 = breit_wigner_amp(m2ab, mres_ab, gam_ab)
+    A2 = breit_wigner_amp(m2bc, mres_bc, gam_bc)
+    coef2 = r2 * np.exp(1j*theta2)
+    Atot = A1 + coef2 * A2
+    return np.abs(Atot)**2
+
+
+# -----------------------------
+# Rejection sampling in Dalitz (Task 2 & 3)
+# -----------------------------
+def sample_weighted_from_phasespace(n, weight_fn, rng=None, wmax=None, pre_sample=200000):
+    """
+    Generic 2D rejection sampler:
+      1) propose from uniform phasespace
+      2) accept with prob w / wmax
+
+    - weight_fn must accept (m2ab, m2bc) arrays and return nonnegative weights.
+    - wmax can be given; if None, estimate from a prescan (speed + correctness).
+    """
+    rng = np.random.default_rng() if rng is None else rng
+
+    # Estimate wmax if not provided (good for acceptance & correctness)
+    if wmax is None:
+        ab0, bc0 = generate_phasespace(pre_sample, rng=rng)
+        w0 = weight_fn(ab0, bc0)
+        wmax = 1.05 * np.max(w0)  # safety margin
+
+    out_ab = np.empty(n, dtype=float)
+    out_bc = np.empty(n, dtype=float)
+    filled = 0
+    chunk = max(20000, n * 10)
+
+    while filled < n:
+        ab_try, bc_try = generate_phasespace(chunk, rng=rng)
+        w = weight_fn(ab_try, bc_try)
+        u = rng.random(size=chunk)
+        acc = u < (w / wmax)
+
+        k = int(np.sum(acc))
+        if k == 0:
+            continue
+
+        take = min(k, n - filled)
+        ab_acc = ab_try[acc]
+        bc_acc = bc_try[acc]
+        out_ab[filled:filled+take] = ab_acc[:take]
+        out_bc[filled:filled+take] = bc_acc[:take]
+        filled += take
+
+    return out_ab, out_bc, wmax
+
+
+# -----------------------------
+# Plot helper
+# -----------------------------
+def plot_dalitz(m2ab, m2bc, bins=300, title="", alpha=1.0):
+    plt.figure(figsize=(7, 6))
+    plt.hist2d(m2ab, m2bc, bins=bins)
+    plt.xlabel(r"$m^2_{KK}$ (GeV$^2$/c$^4$)")   # K+K- = ab
+    plt.ylabel(r"$m^2_{K\pi}$ (GeV$^2$/c$^4$)") # K- pi+ = bc
+    plt.title(title)
+    plt.colorbar(label="Counts")
+    plt.tight_layout()
+
+
+# =========================================================
+# TASK 1
+# =========================================================
+rng = np.random.default_rng(42)
+
+m2ab_ps, m2bc_ps = generate_phasespace(100000, rng=rng)
+plot_dalitz(m2ab_ps, m2bc_ps, bins=300, title="Task 1: Uniform phasespace (n=100000)")
+
+
+# =========================================================
+# TASK 2
+# =========================================================
+def weight_fn_task2(ab, bc):
+    # Only depends on m2ab for resonance in K+K-
+    return weight_single_resonance(ab, mres=mres_ab, gamma=gam_ab)
+
+m2ab_sig2, m2bc_sig2, wmax2 = sample_weighted_from_phasespace(
+    n=5000,
+    weight_fn=lambda ab, bc: weight_fn_task2(ab, bc),
+    rng=rng,
+    wmax=None
+)
+
+# Combine with 10000 phasespace background
+m2ab_bg2, m2bc_bg2 = generate_phasespace(10000, rng=rng)
+plot_dalitz(
+    np.concatenate([m2ab_bg2, m2ab_sig2]),
+    np.concatenate([m2bc_bg2, m2bc_sig2]),
+    bins=300,
+    title="Task 2: Resonance in $K^+K^-$ (5000 signal) + 10000 phasespace background"
+)
+
+
+# =========================================================
+# TASK 3
+# =========================================================
+def make_weight_fn_task3(r2, theta2):
+    return lambda ab, bc: weight_interference(ab, bc, r2=r2, theta2=theta2)
+
+ab0, bc0 = generate_phasespace(200000, rng=rng)
+w_scan = weight_interference(ab0, bc0, r2=1.0, theta2=np.pi/2)
+wmax3 = 1.05 * np.max(w_scan)
+
+thetas = [0.0, np.pi, np.pi/2]
+theta_labels = ["0", r"\pi", r"\pi/2"]
+
+for th, lab in zip(thetas, theta_labels):
+    m2ab_sig3, m2bc_sig3, _ = sample_weighted_from_phasespace(
+        n=5000,
+        weight_fn=make_weight_fn_task3(r2=1.0, theta2=th),
+        rng=rng,
+        wmax=wmax3
+    )
+    m2ab_bg3, m2bc_bg3 = generate_phasespace(10000, rng=rng)
+
+    plot_dalitz(
+        np.concatenate([m2ab_bg3, m2ab_sig3]),
+        np.concatenate([m2bc_bg3, m2bc_sig3]),
+        bins=300,
+        title=fr"Task 3: Interfering resonances (r2=1, $\theta_2={lab}$) + background"
+    )
+
+
+# =========================================================
+# TASK 4a: Log-likelihood fit (NO background)
+# =========================================================
+
+true_r2, true_theta2 = 1.0, np.pi
+m2ab_data, m2bc_data, _ = sample_weighted_from_phasespace(
+    n=5000,
+    weight_fn=make_weight_fn_task3(true_r2, true_theta2),
+    rng=rng,
+    wmax=wmax3
+)
+
+# ---- Speedup marks:
+m2ab_mc, m2bc_mc = generate_phasespace(50000, rng=rng)
+
+# Precompute complex amplitudes so NLL eval is fast
+A1_data = breit_wigner_amp(m2ab_data, mres_ab, gam_ab)
+A2_data = breit_wigner_amp(m2bc_data, mres_bc, gam_bc)
+
+A1_mc = breit_wigner_amp(m2ab_mc, mres_ab, gam_ab)
+A2_mc = breit_wigner_amp(m2bc_mc, mres_bc, gam_bc)
+
+def nll(params):
+    """
+    Negative log-likelihood up to an additive constant:
+      NLL = -sum log(w_data) + n log(mean_w_mc)
+    where w = |A1 + r2 e^{i theta2} A2|^2
+
+    Using mean_w_mc is fine for minimisation because the missing 'Area' is a constant wrt params.
+    """
+    r2, theta2 = params
+
+    # enforce periodic theta in [0, 2pi] smoothly (optimizer still bounded)
+    coef2 = r2 * np.exp(1j * theta2)
+
+    w_d = np.abs(A1_data + coef2 * A2_data)**2
+    w_m = np.abs(A1_mc   + coef2 * A2_mc  )**2
+
+    eps = 1e-300
+    mean_w = np.mean(w_m) + eps
+
+    return -np.sum(np.log(w_d + eps)) + len(w_d) * np.log(mean_w)
+
+# Fit with SciPy minimize (NOT curve_fit) + bounds
+x0 = np.array([0.8, 3.0])  # initial guess
+bounds = [(0.0, 3.0), (0.0, 2*np.pi)]
+
+res = minimize(nll, x0=x0, method="L-BFGS-B", bounds=bounds)
+
+fit_r2, fit_theta2 = res.x
+print("Task 4a fit result:")
+print(f"  r2     = {fit_r2:.4f}   (true {true_r2})")
+print(f"  theta2 = {fit_theta2:.4f} rad (true {true_theta2})")
+print(f"  success={res.success}, message={res.message}")
+
+
+# =========================================================
+# TASK 4b: 1D projections (data vs fitted model)
+# =========================================================
+
+m2ab_mc_proj, m2bc_mc_proj = generate_phasespace(200000, rng=rng)
+A1_mc_proj = breit_wigner_amp(m2ab_mc_proj, mres_ab, gam_ab)
+A2_mc_proj = breit_wigner_amp(m2bc_mc_proj, mres_bc, gam_bc)
+
+coef2_fit = fit_r2 * np.exp(1j * fit_theta2)
+w_proj = np.abs(A1_mc_proj + coef2_fit * A2_mc_proj)**2
+
+# Normalise by total weight so sums correspond to event fractions
+w_total = np.sum(w_proj)
+
+# Choose 1D bins
+bins_1d = 80
+
+
+counts_data_ab, edges_ab = np.histogram(m2ab_data, bins=bins_1d)
+centers_ab = 0.5 * (edges_ab[:-1] + edges_ab[1:])
+
+
+sumw_ab, _ = np.histogram(m2ab_mc_proj, bins=edges_ab, weights=w_proj)
+exp_ab = len(m2ab_data) * (sumw_ab / w_total)
+
+plt.figure(figsize=(8, 5))
+plt.step(edges_ab[:-1], counts_data_ab, where="post", label="Data")
+plt.plot(centers_ab, exp_ab, label="Fit expectation")
+plt.xlabel(r"$m^2_{KK}$ (GeV$^2$/c$^4$)")
+plt.ylabel("Counts / bin")
+plt.title("Task 4b: 1D projection on $m^2_{KK}$")
+plt.legend()
+plt.tight_layout()
+
+# --- Projection in m2bc ---
+counts_data_bc, edges_bc = np.histogram(m2bc_data, bins=bins_1d)
+centers_bc = 0.5 * (edges_bc[:-1] + edges_bc[1:])
+
+sumw_bc, _ = np.histogram(m2bc_mc_proj, bins=edges_bc, weights=w_proj)
+exp_bc = len(m2bc_data) * (sumw_bc / w_total)
+
+plt.figure(figsize=(8, 5))
+plt.step(edges_bc[:-1], counts_data_bc, where="post", label="Data")
+plt.plot(centers_bc, exp_bc, label="Fit expectation")
+plt.xlabel(r"$m^2_{K\pi}$ (GeV$^2$/c$^4$)")
+plt.ylabel("Counts / bin")
+plt.title("Task 4b: 1D projection on $m^2_{K\pi}$")
+plt.legend()
+plt.tight_layout()
+
+plt.show()
